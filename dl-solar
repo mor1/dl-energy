@@ -146,6 +146,8 @@ if __name__ == "__main__":
     log.debug(f"{config['appid']=}")
 
     DATE = sys.argv[1]  # yyyy-mm-dd
+    if DATE == "yesterday":
+        DATE = (datetime.date.today() - datetime.timedelta(1)).isoformat()
     check_date(DATE)
 
     asyncio.run(main(config, DATE))
