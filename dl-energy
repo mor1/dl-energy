@@ -303,6 +303,13 @@ Sources = {
 
 
 @click.command()
+@click.option(
+    "-c",
+    "--config",
+    "configfile",
+    default="dl-energy.toml",
+    help="Specify TOML config file.",
+)
 @click.option("-l", "--loglevel", default="INFO", help="Set log level.")
 @click.option(
     "-s",
@@ -314,12 +321,13 @@ Sources = {
 )
 @click.argument("date")
 def cli(
+    configfile: str,
     loglevel: str,
     ss: str,
     date: str,
 ):
     logging.getLogger().setLevel(loglevel.upper())
-    with open("dl-solar.toml", "rb") as f:
+    with open(configfile, "rb") as f:
         config = tomllib.load(f)
     log.debug(f"{config=}")
 
