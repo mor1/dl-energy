@@ -9,29 +9,22 @@ import datetime
 import hashlib
 import json
 import logging
+import pathlib
 import sys
 import time
 
 import aiohttp
+import click
 import tomllib
 from rich.logging import RichHandler
 
-logging.basicConfig(
-    level="INFO", format="%(message)s", datefmt="[%X]", handlers=[RichHandler()]
-)
+logging.basicConfig(format="%(message)s", datefmt="[%X]", handlers=[RichHandler()])
 log = logging.getLogger(__name__)
 
 
 def fail(s: str, n: int = -1) -> None:
     log.critical(s)
     sys.exit(n)
-
-
-def sign(config: dict, ts: str) -> str:
-    s = "%s%s%s" % (config["appid"], config["secret"], ts)
-    signature = str(hashlib.sha512((s).encode("ascii")).hexdigest())
-    log.debug(f"{config['appid']=} {ts=} {signature=}")
-    return signature
 
 
 def check_date(d: str):
@@ -47,19 +40,15 @@ def fmt(r: dict | None) -> str:
     return json.dumps(r, indent=2)
 
 
-async def get(config: dict, endpoint: str, params: dict) -> dict:
-    timestamp = str(int(time.time()))
-    signature = sign(config, timestamp)
-    url = f"https://openapi.alphaess.com/api/{endpoint}"
-    headers = {"appId": config["appid"], "timeStamp": timestamp, "sign": signature}
-
+async def get(url: str, headers: dict, params: dict) -> dict:
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers, params=params) as response:
-            log.debug(f"{response=}")
+            log.debug(f"get: {response=}")
             data = await response.json()
             match response.status:
                 case 200:
-                    return data["data"]
+                    log.debug(f"get: {data=}")
+                    return data
                 case _:
                     log.debug(f"{response=}")
                     fail(f"get: {response.status=} {data=}")
@@ -67,23 +56,82 @@ async def get(config: dict, endpoint: str, params: dict) -> dict:
     return {}  # unreached
 
 
-async def main(
-    config: dict,
-    date: str,
-) -> None:
-    params = {"queryDate": date}
+class Source:
+    def __init__(self, config: dict, now: str) -> None:
+        assert False
 
-    async def _get(ep):
-        log.debug(f"{config=} {ep=} {params=}")
-        r = await get(config, ep, params)
-        log.debug(f"{r=}")
-        return r
+    async def fetch(self, date: str) -> dict:
+        assert False
 
-    for sn in (i["sysSn"] for i in await _get("getEssList")):
-        params["sysSn"] = sn
+    def dump(self, basedir: str, date: str, data: dict) -> None:
+        assert False
 
-        power = await _get("getOneDayPowerBySn")  # system, day's energy consumption
-        log.debug(f"{power}")
+
+class AlphaESS(Source):
+    def __init__(self, config, now):
+        self.timestamp = now
+        self.config = config
+
+    def sign(self) -> str:
+        appid = self.config["appid"]
+        secret = self.config["secret"]
+        timestamp = self.timestamp
+        s = "%s%s%s" % (appid, secret, timestamp)
+        signature = str(hashlib.sha512((s).encode("ascii")).hexdigest())
+        log.debug(f"{appid=} {timestamp=} {signature=}")
+        return signature
+
+    def request(self, endpoint):
+        log.debug(f"AlphaESS.request {endpoint=}")
+        url = f"https://openapi.alphaess.com/api/{endpoint}"
+        headers = {
+            "appId": self.config["appid"],
+            "timeStamp": self.timestamp,
+            "sign": self.sign(),
+        }
+        return url, headers
+
+    async def fetch(
+        self,
+        date: str,
+    ):
+        data = {}
+
+        url, headers = self.request("getEssList")
+        params = {"queryDate": date}
+        response = await get(url, headers, params)
+        log.debug(f"fetch: {response=}")
+        for sn in (i["sysSn"] for i in response["data"]):
+            params["sysSn"] = sn
+
+            url, headers = self.request("getOneDayPowerBySn")
+            power = await get(url, headers, params)  # system, day's energy consumption
+
+            url, headers = self.request("getOneDateEnergyBySn")
+            energy = await get(url, headers, params)
+
+            # XXX must run as a service; unclear update frequency
+            # recent = await _get("getLastPowerData")
+            # log.info(f"{recent=}")
+
+            data[sn] = {
+                "power": power["data"],
+                "energy": energy["data"],
+            }
+
+        log.debug(f"fetch: {fmt(data)}")
+        return data
+
+    def dump(
+        self,
+        basedir: str,
+        date: str,
+        data: dict,
+    ):
+        assert len(data.keys()) == 1
+        data = list(data.values())[0]
+        filename = f"{basedir}/alphaess/{date}.tsv"
+
         fieldsmap = {
             "ts": "ts",
             "uploadTime": "time",
@@ -98,7 +146,7 @@ async def main(
         }
         power = [
             {fieldsmap[k]: v for k, v in row.items() if fieldsmap.get(k)}
-            for row in power
+            for row in data["power"]
         ]
         for row in power:
             dt = datetime.datetime.fromisoformat(row["time"]).astimezone()
@@ -111,13 +159,8 @@ async def main(
             row["from-battery(Wh)"] = -1 * diff if diff < 0 else 0
         power = sorted(power, key=lambda row: row["ts"])
 
-        energy = await _get("getOneDateEnergyBySn")
-        log.debug(f"{energy=}")
-        # XXX must run as a service; unclear update frequency
-        # recent = await _get("getLastPowerData")
-        # log.info(f"{recent=}")
-
-        with open(f"{config['target']}/{date}.tsv", "w") as tsvf:
+        energy = data["energy"]
+        with open(f"{filename}", "w") as tsvf:
             tsvf.write(
                 f"# {energy['theDate']}"
                 f"\tto-battery(kWh)={energy['eCharge']}"
@@ -139,15 +182,69 @@ async def main(
                 tsvw.writerow(row)
 
 
-if __name__ == "__main__":
+class Octopus(Source):
+    def __init__(self, config, now):
+        self.timestamp = now
+        self.config = config
+
+    async def fetch(self, date: str) -> dict:
+        return {}
+
+    def dump(self, basedir, date, data) -> None:
+        pass
+
+
+class Energi(Source):
+    def __init__(self, config, now):
+        self.timestamp = now
+        self.config = config
+
+    async def fetch(self, date: str) -> dict:
+        return {}
+
+    def dump(self, basedir, date, data) -> None:
+        pass
+
+
+async def main(
+    config: dict,
+    sources: list,
+    date: str,
+) -> None:
+    log.info(f"{pathlib.Path(__file__).stem} {date=}")
+
+    for source in sources:
+        data = await source.fetch(date)
+        source.dump(config["basedir"], date, data)
+
+
+@click.command()
+@click.option("-l", "--loglevel", default="INFO", help="Set log level")
+@click.option("-s", "--source", default="ALL", help="Data source from which to fetch")
+@click.argument("date")  # yyyy-mm-dd
+def cli(
+    loglevel: str,
+    source: str,
+    date: str,
+):
+    logging.getLogger().setLevel(loglevel.upper())
     with open("dl-solar.toml", "rb") as f:
         config = tomllib.load(f)
+    log.debug(f"{config=}")
 
-    log.debug(f"{config['appid']=}")
+    if date == "yesterday":
+        date = (datetime.date.today() - datetime.timedelta(1)).isoformat()
+    check_date(date)
 
-    DATE = sys.argv[1]  # yyyy-mm-dd
-    if DATE == "yesterday":
-        DATE = (datetime.date.today() - datetime.timedelta(1)).isoformat()
-    check_date(DATE)
+    now = str(int(time.time()))
 
-    asyncio.run(main(config, DATE))
+    sources = [
+        AlphaESS(config["secrets"]["alphaess"], now),
+        Octopus(config["secrets"]["octopus"], now),
+        Energi(config["secrets"]["myenergi"], now),
+    ]
+    asyncio.run(main(config, sources, date))
+
+
+if __name__ == "__main__":
+    cli()
