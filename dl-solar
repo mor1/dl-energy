@@ -2,7 +2,6 @@
 
 # Copyright 2024 Richard Mortier <mort@cantab.net>
 # SPDX-License-Identifier: BSD-3-Clause
-
 import asyncio
 import base64
 import csv
@@ -14,8 +13,8 @@ import pathlib
 import sys
 import time
 
-import aiohttp
 import click
+import httpx
 import tomllib
 from rich.logging import RichHandler
 
@@ -41,18 +40,18 @@ def fmt(r: dict | None) -> str:
     return json.dumps(r, indent=2)
 
 
-async def get(url: str, headers: dict, params: dict) -> dict:
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers, params=params) as response:
-            log.debug(f"get: {response=}")
-            data = await response.json()
-            match response.status:
-                case 200:
-                    log.debug(f"get: {data=}")
-                    return data
-                case _:
-                    log.debug(f"{response=}")
-                    fail(f"get: {response.status=} {data=}")
+async def get(url: str, headers: dict, params: dict = {}, auth=None) -> dict:
+    async with httpx.AsyncClient() as session:
+        response = await session.get(url, headers=headers, params=params, auth=auth)
+        log.debug(f"get: {response=}")
+        data = response.json()
+        match response.status_code:
+            case 200:
+                log.debug(f"get: {data=}")
+                return data
+            case _:
+                log.debug(f"get: {response=}")
+                fail(f"get: {response.status_code=} {data=}")
     assert False
     return {}  # unreached
 
@@ -98,11 +97,11 @@ class AlphaESS(Source):
         timestamp = self.timestamp
         s = "%s%s%s" % (appid, secret, timestamp)
         signature = str(hashlib.sha512((s).encode("ascii")).hexdigest())
-        log.debug(f"{appid=} {timestamp=} {signature=}")
+        log.debug(f"AlphaESS.sign: {appid=} {timestamp=} {signature=}")
         return signature
 
     def request(self, endpoint):
-        log.debug(f"AlphaESS.request {endpoint=}")
+        log.debug(f"AlphaESS.request: {endpoint=}")
         url = f"https://openapi.alphaess.com/api/{endpoint}"
         headers = {
             "appId": self.secrets["appid"],
@@ -184,6 +183,7 @@ class AlphaESS(Source):
 
 
 class Octopus(Source):
+    # https://docs.octopus.energy/rest/reference
     def __init__(self, basedir, secrets, date, now):
         self.timestamp = now
         self.secrets = secrets
@@ -197,7 +197,7 @@ class Octopus(Source):
 
         url = f"https://api.octopus.energy/v1/electricity-meter-points/{mpan}/meters/{meter}/consumption/"
         headers = {
-            "Authorization": f"Basic {auth}",
+            "Authorization": f"Basic {auth}",  # basic auth, by hand
         }
         params = {
             "page_size": 100,  # >> number of half-hour periods in 24h
@@ -206,13 +206,12 @@ class Octopus(Source):
             "order_by": "period",
         }
         response = await get(url, headers, params)
-        log.debug(f"{response=}")
-        assert response["count"] == 48
-
+        log.debug(f"{fmt(response)}")
+        assert response["count"] <= 48
         return response["results"]
 
     def dump(self, data) -> None:
-        log.debug(f"{fmt(data)}")
+        log.debug(f"dump: {fmt(data)}")
 
         header = ""
         fieldsmap = {
@@ -234,6 +233,7 @@ class Octopus(Source):
 
 
 class MyEnergi(Source):
+    # https://github.com/twonk/MyEnergi-App-Api
     def __init__(self, basedir, secrets, date, now):
         self.timestamp = now
         self.secrets = secrets
@@ -241,10 +241,52 @@ class MyEnergi(Source):
         self.filename = f"{basedir}/myenergi/{date}.tsv"
 
     async def fetch(self) -> dict:
-        return {}
+        serial = self.secrets["serial"]
+        apikey = self.secrets["apikey"]
+
+        url = f"https://s18.myenergi.net/cgi-jday-Z{serial}-{self.date}"
+        headers = {
+            "Accept": "application/json",
+            "Content-type": "application/json",
+        }
+        auth = httpx.DigestAuth(serial, apikey)
+        response = await get(url, headers, auth=auth)
+        log.debug(f"MyEnergi.fetch: {response=}")
+
+        return response[f"U{serial}"]
 
     def dump(self, data) -> None:
-        pass
+        log.debug(f"{fmt(data)}")
+        assert len(data) <= 1441
+
+        for v in data:
+            for k in ("hr", "min", "imp", "exp"):
+                if k not in v:
+                    v[k] = 0
+            isotime = (
+                f"{v['yr']}-{v['mon']:02}-{v['dom']:02}T{v['hr']:02}:{v['min']:02}"
+            )
+            dt = datetime.datetime.fromisoformat(isotime).astimezone()
+            v["ts"] = int(dt.timestamp())
+            v["time"] = dt.isoformat()
+
+        fieldsmap = {
+            "ts": "ts",
+            "time": "time",
+            "exp": "to-grid(J)",
+            "imp": "from-grid(J)",
+            "v1": "voltage(V)",
+            "frq": "frequency(Hz)",
+        }
+        rows = sorted(
+            [
+                {fieldsmap[k]: v for k, v in row.items() if fieldsmap.get(k)}
+                for row in data
+            ],
+            key=lambda row: row["ts"],
+        )
+
+        writecsv(self.filename, "", fieldsmap.values(), rows)
 
 
 async def main(sources: list) -> None:
@@ -253,13 +295,27 @@ async def main(sources: list) -> None:
         source.dump(data)
 
 
+Sources = {
+    "alphaess": AlphaESS,
+    "octopus": Octopus,
+    "myenergi": MyEnergi,
+}
+
+
 @click.command()
-@click.option("-l", "--loglevel", default="INFO", help="Set log level")
-@click.option("-s", "--source", default="ALL", help="Data source from which to fetch")
-@click.argument("date")  # yyyy-mm-dd
+@click.option("-l", "--loglevel", default="INFO", help="Set log level.")
+@click.option(
+    "-s",
+    "--source",
+    "ss",
+    multiple=True,
+    default=Sources.keys(),
+    help="Data source.",
+)
+@click.argument("date")
 def cli(
     loglevel: str,
-    source: str,
+    ss: str,
     date: str,
 ):
     logging.getLogger().setLevel(loglevel.upper())
@@ -270,14 +326,14 @@ def cli(
     if date == "yesterday":
         date = (datetime.date.today() - datetime.timedelta(1)).isoformat()
     check_date(date)
+    log.info(f"{date=}")
 
     now = str(int(time.time()))
 
-    sources = [
-        # AlphaESS(config["basedir"], config["secrets"]["alphaess"], date, now),
-        Octopus(config["basedir"], config["secrets"]["octopus"], date, now),
-        # NyEnergi(config["basedir"], config["secrets"]["myenergi"], date, now),
+    sources: list[Source] = [
+        Sources[s](config["basedir"], config["secrets"][s], date, now) for s in ss
     ]
+
     asyncio.run(main(sources))
 
 
