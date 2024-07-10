@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import asyncio
+import base64
 import csv
 import datetime
 import hashlib
@@ -56,25 +57,44 @@ async def get(url: str, headers: dict, params: dict) -> dict:
     return {}  # unreached
 
 
+def writecsv(filename, header, fieldnames, rows):
+    pathlib.Path(filename).parent.mkdir(exist_ok=True, parents=True)
+
+    with open(f"{filename}", "w") as tsvf:
+        tsvf.write(header)
+        tsvw = csv.DictWriter(
+            tsvf,
+            fieldnames=fieldnames,
+            extrasaction="raise",
+            delimiter="\t",
+            dialect="excel",
+        )
+        tsvw.writeheader()
+        for row in rows:
+            tsvw.writerow(row)
+
+
 class Source:
-    def __init__(self, config: dict, now: str) -> None:
+    def __init__(self, basedir: str, secrets: dict, date: str, now: str) -> None:
         assert False
 
-    async def fetch(self, date: str) -> dict:
+    async def fetch(self) -> dict:
         assert False
 
-    def dump(self, basedir: str, date: str, data: dict) -> None:
+    def dump(self, data: dict) -> None:
         assert False
 
 
 class AlphaESS(Source):
-    def __init__(self, config, now):
+    def __init__(self, basedir, secrets, date, now):
         self.timestamp = now
-        self.config = config
+        self.secrets = secrets
+        self.date = date
+        self.filename = f"{basedir}/alphaess/{date}.tsv"
 
     def sign(self) -> str:
-        appid = self.config["appid"]
-        secret = self.config["secret"]
+        appid = self.secrets["appid"]
+        secret = self.secrets["secret"]
         timestamp = self.timestamp
         s = "%s%s%s" % (appid, secret, timestamp)
         signature = str(hashlib.sha512((s).encode("ascii")).hexdigest())
@@ -85,20 +105,17 @@ class AlphaESS(Source):
         log.debug(f"AlphaESS.request {endpoint=}")
         url = f"https://openapi.alphaess.com/api/{endpoint}"
         headers = {
-            "appId": self.config["appid"],
+            "appId": self.secrets["appid"],
             "timeStamp": self.timestamp,
             "sign": self.sign(),
         }
         return url, headers
 
-    async def fetch(
-        self,
-        date: str,
-    ):
+    async def fetch(self):
         data = {}
 
         url, headers = self.request("getEssList")
-        params = {"queryDate": date}
+        params = {"queryDate": self.date}
         response = await get(url, headers, params)
         log.debug(f"fetch: {response=}")
         for sn in (i["sysSn"] for i in response["data"]):
@@ -122,15 +139,9 @@ class AlphaESS(Source):
         log.debug(f"fetch: {fmt(data)}")
         return data
 
-    def dump(
-        self,
-        basedir: str,
-        date: str,
-        data: dict,
-    ):
+    def dump(self, data: dict):
         assert len(data.keys()) == 1
         data = list(data.values())[0]
-        filename = f"{basedir}/alphaess/{date}.tsv"
 
         fieldsmap = {
             "ts": "ts",
@@ -160,62 +171,86 @@ class AlphaESS(Source):
         power = sorted(power, key=lambda row: row["ts"])
 
         energy = data["energy"]
-        with open(f"{filename}", "w") as tsvf:
-            tsvf.write(
-                f"# {energy['theDate']}"
-                f"\tto-battery(kWh)={energy['eCharge']}"
-                f"\tfrom-battery(kWh)={energy['eDischarge']}"
-                f"\tto-grid(kWh)={energy['eDischarge']}"
-                f"\tfrom-grid(kWh)={energy['eInput']}"
-                f"\tfrom-pv(kWh)={energy['epv']}"
-                "\n"
-            )
-            tsvw = csv.DictWriter(
-                tsvf,
-                fieldnames=fieldsmap.values(),
-                extrasaction="raise",
-                delimiter="\t",
-                dialect="excel",
-            )
-            tsvw.writeheader()
-            for row in power:
-                tsvw.writerow(row)
+        header = (
+            f"# {energy['theDate']}"
+            f"\tto-battery(kWh)={energy['eCharge']}"
+            f"\tfrom-battery(kWh)={energy['eDischarge']}"
+            f"\tto-grid(kWh)={energy['eDischarge']}"
+            f"\tfrom-grid(kWh)={energy['eInput']}"
+            f"\tfrom-pv(kWh)={energy['epv']}"
+            "\n"
+        )
+        writecsv(self.filename, header, fieldsmap.values(), power)
 
 
 class Octopus(Source):
-    def __init__(self, config, now):
+    def __init__(self, basedir, secrets, date, now):
         self.timestamp = now
-        self.config = config
+        self.secrets = secrets
+        self.date = date
+        self.filename = f"{basedir}/octopus/{date}.tsv"
 
-    async def fetch(self, date: str) -> dict:
+    async def fetch(self) -> dict:
+        mpan = self.secrets["mpan"]
+        meter = self.secrets["meter"]
+        auth = base64.b64encode(f"{self.secrets['apikey']}".encode()).decode()
+
+        url = f"https://api.octopus.energy/v1/electricity-meter-points/{mpan}/meters/{meter}/consumption/"
+        headers = {
+            "Authorization": f"Basic {auth}",
+        }
+        params = {
+            "page_size": 100,  # >> number of half-hour periods in 24h
+            "period_from": f"{self.date}T00:00:00Z",
+            "period_to": f"{self.date}T23:59:59Z",
+            "order_by": "period",
+        }
+        response = await get(url, headers, params)
+        log.debug(f"{response=}")
+        assert response["count"] == 48
+
+        return response["results"]
+
+    def dump(self, data) -> None:
+        log.debug(f"{fmt(data)}")
+
+        header = ""
+        fieldsmap = {
+            "interval_start": "ts",
+            "consumption": "from-grid(Wh)",
+        }
+        rows = sorted(
+            (
+                {
+                    "ts": v["interval_start"],
+                    "from-grid(Wh)": v["consumption"],
+                }
+                for v in data
+            ),
+            key=lambda row: row["ts"],
+        )
+
+        writecsv(self.filename, header, fieldsmap.values(), rows)
+
+
+class MyEnergi(Source):
+    def __init__(self, basedir, secrets, date, now):
+        self.timestamp = now
+        self.secrets = secrets
+        self.date = date
+        self.filename = f"{basedir}/myenergi/{date}.tsv"
+
+    async def fetch(self) -> dict:
         return {}
 
-    def dump(self, basedir, date, data) -> None:
+    def dump(self, data) -> None:
         pass
 
 
-class Energi(Source):
-    def __init__(self, config, now):
-        self.timestamp = now
-        self.config = config
-
-    async def fetch(self, date: str) -> dict:
-        return {}
-
-    def dump(self, basedir, date, data) -> None:
-        pass
-
-
-async def main(
-    config: dict,
-    sources: list,
-    date: str,
-) -> None:
-    log.info(f"{pathlib.Path(__file__).stem} {date=}")
-
+async def main(sources: list) -> None:
     for source in sources:
-        data = await source.fetch(date)
-        source.dump(config["basedir"], date, data)
+        data = await source.fetch()
+        source.dump(data)
 
 
 @click.command()
@@ -239,11 +274,11 @@ def cli(
     now = str(int(time.time()))
 
     sources = [
-        AlphaESS(config["secrets"]["alphaess"], now),
-        Octopus(config["secrets"]["octopus"], now),
-        Energi(config["secrets"]["myenergi"], now),
+        # AlphaESS(config["basedir"], config["secrets"]["alphaess"], date, now),
+        Octopus(config["basedir"], config["secrets"]["octopus"], date, now),
+        # NyEnergi(config["basedir"], config["secrets"]["myenergi"], date, now),
     ]
-    asyncio.run(main(config, sources, date))
+    asyncio.run(main(sources))
 
 
 if __name__ == "__main__":
