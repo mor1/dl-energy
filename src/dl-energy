@@ -42,7 +42,12 @@ def fmt(r: dict | None) -> str:
 
 async def get(url: str, headers: dict, params: dict = {}, auth=None) -> dict:
     async with httpx.AsyncClient() as session:
-        response = await session.get(url, headers=headers, params=params, auth=auth)
+        while True:
+            try:
+                response = await session.get(url, headers=headers, params=params, auth=auth, timeout=20.0)
+                break
+            except httpx.ReadTimeout:
+                log.warn(f"httpx.ReadTimeout: retrying")
         log.debug(f"get: {response=}")
         data = response.json()
         match response.status_code:
