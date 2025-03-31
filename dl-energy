@@ -1,5 +1,13 @@
-#!/usr/bin/env python3
-#!/usr/bin/env -S uv run
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "click==8.1.7",
+#     "httpx==0.27.0",
+#     "logging==0.4.9.6",
+#     "rich==13.7.1",
+# ]
+# ///
 
 # Copyright 2024 Richard Mortier <mort@cantab.net>
 # SPDX-License-Identifier: BSD-3-Clause
@@ -10,6 +18,7 @@ import datetime
 import hashlib
 import json
 import logging
+import os
 import pathlib
 import sys
 import time
@@ -21,6 +30,8 @@ from rich.logging import RichHandler
 
 logging.basicConfig(format="%(message)s", datefmt="[%X]", handlers=[RichHandler()])
 log = logging.getLogger(__name__)
+
+cwd = os.path.realpath(os.path.dirname(__file__))
 
 
 def fail(s: str, n: int = -1) -> None:
@@ -46,10 +57,12 @@ async def get(url: str, headers: dict, params: dict = {}, auth=None) -> dict:
     async with httpx.AsyncClient() as session:
         while True:
             try:
-                response = await session.get(url, headers=headers, params=params, auth=auth, timeout=20.0)
+                response = await session.get(
+                    url, headers=headers, params=params, auth=auth, timeout=20.0
+                )
                 break
             except httpx.ReadTimeout:
-                log.warning(f"httpx.ReadTimeout: retrying")
+                log.warning("httpx.ReadTimeout: retrying")
         log.debug(f"get: {response=}")
         data = response.json()
         match response.status_code:
@@ -309,6 +322,7 @@ async def main(sources: list) -> None:
         except TypeError:
             log.warning(f"main.dump failed; {data=}")
 
+
 Sources = {
     "alphaess": AlphaESS,
     "octopus": Octopus,
@@ -321,7 +335,8 @@ Sources = {
     "-c",
     "--config",
     "configfile",
-    default="dl-energy.toml",
+    default=os.path.join(cwd, "dl-energy.toml"),
+    type=click.File("rb"),
     help="Specify TOML config file.",
 )
 @click.option("-l", "--loglevel", default="INFO", help="Set log level.")
@@ -335,14 +350,13 @@ Sources = {
 )
 @click.argument("date")
 def cli(
-    configfile: str,
+    configfile: click.File,
     loglevel: str,
     ss: str,
     date: str,
 ):
     logging.getLogger().setLevel(loglevel.upper())
-    with open(configfile, "rb") as f:
-        config = tomllib.load(f)
+    config = tomllib.load(configfile)
     log.debug(f"{config=}")
 
     if date == "yesterday":
