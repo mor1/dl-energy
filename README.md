@@ -36,9 +36,9 @@ curl --digest -u '$SERIALNO:$APIKEY' \
 
 1. Obtain API key from website
 2. Extract MPAN and Meter Serial Number via
- 
+
 ```bash
-curl -u '$APIKEY:' \ 
+curl -u '$APIKEY:' \
   'https://api.octopus.energy/v1/accounts/<account-number>/'  \
   | jq '{number: .number, \
          mpan: .properties[].electricity_meter_points[].mpan, \

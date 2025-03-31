@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#!/usr/bin/env -S uv run
 
 # Copyright 2024 Richard Mortier <mort@cantab.net>
 # SPDX-License-Identifier: BSD-3-Clause
@@ -41,13 +42,14 @@ def fmt(r: dict | None) -> str:
 
 
 async def get(url: str, headers: dict, params: dict = {}, auth=None) -> dict:
+    log.debug(f"get: {url=} {headers=} {params=} {auth=}")
     async with httpx.AsyncClient() as session:
         while True:
             try:
                 response = await session.get(url, headers=headers, params=params, auth=auth, timeout=20.0)
                 break
             except httpx.ReadTimeout:
-                log.warn(f"httpx.ReadTimeout: retrying")
+                log.warning(f"httpx.ReadTimeout: retrying")
         log.debug(f"get: {response=}")
         data = response.json()
         match response.status_code:
@@ -296,9 +298,16 @@ class MyEnergi(Source):
 
 async def main(sources: list) -> None:
     for source in sources:
-        data = await source.fetch()
-        source.dump(data)
+        try:
+            data = await source.fetch()
+        except TypeError:
+            log.warning(f"main.fetch failed; {data=}")
+            continue
 
+        try:
+            source.dump(data)
+        except TypeError:
+            log.warning(f"main.dump failed; {data=}")
 
 Sources = {
     "alphaess": AlphaESS,

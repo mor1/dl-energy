@@ -10,7 +10,3 @@ dependencies = [
     "logging==0.4.9.6",
     "rich==13.7.1",
 ]
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
